@@ -1,0 +1,10 @@
+{
+  "name": "Faulter",
+  "short_name": "Faulter",
+  "description": "World News, Breaking Stories, In-Depth Reporting",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}

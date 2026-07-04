@@ -1,0 +1,420 @@
+{
+  "extends": ["next/core-web-vitals", "next/typescript"],
+  "rules": {
+    "@next/next/no-img-element": "off",
+    "@next/next/no-page-custom-font": "off",
+    "react/no-unescaped-entities": "off",
+    "@typescript-eslint/no-unused-vars": ["warn", {
+      "argsIgnorePattern": "^_",
+      "varsIgnorePattern": "^_",
+      "caughtErrorsIgnorePattern": "^_"
+    }],
+
+    // ── M-4 fix: HTML-producing Markdown renderer import guard ───────────────
+    //
+    // CSRF CONTEXT: csrf_token is intentionally not HttpOnly (required by the
+    // double-submit cookie pattern).  This means any same-origin XSS directly
+    // enables CSRF: the attacker reads the cookie and forges X-CSRF-Token.
+    // The XSS defence is the sanitize-html allowlist in lib/sanitize.ts.
+    //
+    // Markdown renderers that produce raw HTML strings are the most common
+    // way new XSS paths are accidentally introduced:
+    //
+    //   • marked      — .parse() returns an HTML string; no sanitization by default
+    //   • showdown    — .makeHtml() returns an HTML string; no sanitization
+    //   • markdown-it — .render() returns an HTML string; mode 'html:true' is unsafe
+    //   • remarkable  — .render() returns an HTML string; no sanitization
+    //   • remark-html — remark plugin that serialises AST to raw HTML
+    //
+    // If any of these are used with dangerouslySetInnerHTML without piping the
+    // output through sanitizeArticleContent() first, it opens an XSS → CSRF
+    // escalation path regardless of how the rest of the codebase is structured.
+    //
+    // This rule fires on any import of these packages, requiring an explicit
+    // eslint-disable comment with a written justification confirming:
+    //   (a) the renderer output is piped through sanitizeArticleContent(), OR
+    //   (b) the renderer is used in a context that never reaches the DOM, OR
+    //   (c) an alternative safe renderer (e.g. remark → rehype → custom serialiser
+    //       with an allowlist) has been chosen and reviewed.
+    //
+    // Safe alternatives that do NOT trigger this rule:
+    //   • remark (AST only — never produces HTML without a serialiser plugin)
+    //   • unified (pipeline only — depends on which plugins are added)
+    //   • mdast-util-* (AST transformers — no HTML output by themselves)
+    //
+    // See lib/csrf.ts for the full XSS → CSRF escalation analysis.
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "name": "marked",
+            "message": "⚠️  M-4: 'marked' produces raw HTML strings that are unsafe for dangerouslySetInnerHTML without sanitization. In this codebase, any XSS vulnerability directly enables CSRF forgery (csrf_token is not HttpOnly — required by the double-submit pattern). If you need Markdown rendering, pipe the output through sanitizeArticleContent() before passing it to dangerouslySetInnerHTML. To suppress after a conscious review, add eslint-disable-next-line with a justification. See lib/csrf.ts."
+          },
+          {
+            "name": "showdown",
+            "message": "⚠️  M-4: 'showdown' produces raw HTML strings that are unsafe for dangerouslySetInnerHTML without sanitization. In this codebase, any XSS vulnerability directly enables CSRF forgery (csrf_token is not HttpOnly — required by the double-submit pattern). Pipe output through sanitizeArticleContent() or choose a safe AST-based renderer. See lib/csrf.ts."
+          },
+          {
+            "name": "markdown-it",
+            "message": "⚠️  M-4: 'markdown-it' produces raw HTML. Safe use requires both { html: false } option AND piping through sanitizeArticleContent(). In this codebase, any XSS enables CSRF (csrf_token is not HttpOnly). Add eslint-disable-next-line with written justification confirming both safeguards are in place. See lib/csrf.ts."
+          },
+          {
+            "name": "remarkable",
+            "message": "⚠️  M-4: 'remarkable' produces raw HTML strings without built-in sanitization. Any XSS in this codebase enables CSRF (csrf_token is not HttpOnly). Pipe output through sanitizeArticleContent() before DOM insertion. See lib/csrf.ts."
+          },
+          {
+            "name": "remark-html",
+            "message": "⚠️  M-4: 'remark-html' serialises the remark AST directly to a raw HTML string. The output is unsafe for dangerouslySetInnerHTML without sanitization. Use remark → rehype → custom serialiser with an allowlist instead, or pipe through sanitizeArticleContent(). Any XSS enables CSRF here (csrf_token is not HttpOnly). See lib/csrf.ts."
+          }
+        ]
+      }
+    ],
+
+    // ── dangerouslyAllowSVG guard (M-2 fix) ─────────────────────────────────
+    //
+    // ORIGINAL DESIGN FLAW (C-2 / pre-M-2):
+    // The previous rule only fired when `dangerouslyAllowSVG: true` appeared
+    // alongside a non-empty `remotePatterns` array IN THE SAME FILE.  That
+    // co-occurrence check missed two real attack paths:
+    //
+    //   PATH A — Config split across files:
+    //     A CI step or config merge could add `remotePatterns` entries in a
+    //     separate config fragment that is spread-merged into next.config.mjs.
+    //     The same-file rule never sees both keys together, so it never fires.
+    //
+    //   PATH B — User-controlled writes to public/ (the M-2 finding):
+    //     Even with remotePatterns: [], dangerouslyAllowSVG: true is dangerous
+    //     if any pipeline step (CMS sync, CI artefact, webhook handler) can
+    //     write files to public/.  next/image will serve those files, and a
+    //     crafted SVG written to public/ before build would execute JavaScript
+    //     at the main origin.  The co-occurrence condition does NOT protect
+    //     against this — remotePatterns can stay empty the whole time.
+    //
+    // M-2 FIX:
+    // The rule now fires on `dangerouslyAllowSVG: true` UNCONDITIONALLY,
+    // regardless of what else is in the same file.  To suppress the error after
+    // a conscious security review, add an `eslint-disable-next-line` comment
+    // directly above the flag with a written justification explaining:
+    //   (1) why dangerouslyAllowSVG is needed here (e.g. serving local SVGs)
+    //   (2) why it is safe (e.g. remotePatterns is empty AND no user-controlled
+    //       content can reach any image path served by next/image)
+    //   (3) which conditions would require removing it (document the triggers)
+    //
+    // This forces a pause and an articulated safety argument every time the flag
+    // appears — visible in code review — rather than relying on the file-level
+    // co-occurrence heuristic.
+    //
+    // The existing disable comment + justification in next.config.mjs already
+    // satisfies this requirement; no change to that file is needed.
+    //
+    // RULE 1 — standalone dangerouslyAllowSVG guard (replaces co-occurrence):
+    // Fires whenever `dangerouslyAllowSVG: true` appears in ANY JS/MJS/TS file.
+    //
+    // RULE 2 — remotePatterns addition reminder (retained as extra tripwire):
+    // Fires when `remotePatterns` grows to a non-empty array in the same file,
+    // reminding the developer to verify dangerouslyAllowSVG is false.  This is
+    // now a secondary reminder, not the primary guard.
+
+    // ── dangerouslySetInnerHTML guard (H-2) ─────────────────────────────────
+    //
+    // CSRF CONTEXT: lib/csrf.ts sets csrf_token with httpOnly: false so that
+    // client-side JavaScript can read it for the double-submit cookie pattern.
+    // This means any same-origin XSS can read the cookie and forge the
+    // X-CSRF-Token header, completely bypassing CSRF protection.
+    //
+    // The site's current XSS defence is lib/sanitize.ts (sanitizeArticleContent
+    // + sanitizeText via the sanitize-html allowlist).  The CSRF protection is
+    // therefore only as strong as the XSS protection.
+    //
+    // RULE 3 — dangerouslySetInnerHTML guard:
+    // Fires on any new `dangerouslySetInnerHTML` usage EXCEPT the two
+    // pre-approved patterns that already exist in the codebase:
+    //
+    //   ALLOWED A — safeJsonLd(…): JSON-LD <script type="application/ld+json">
+    //     blocks.  safeJsonLd() only calls JSON.stringify + Unicode-escape of
+    //     </>&' — it cannot produce executable HTML.  XSS via JSON-LD is not
+    //     possible unless a future change removes the escaping.
+    //
+    //   ALLOWED B — safeContent: article body HTML that has been run through
+    //     sanitizeArticleContent() (the sanitize-html allowlist).  Any new
+    //     CMS content path that bypasses sanitizeArticleContent() would open an
+    //     XSS vector and must not use dangerouslySetInnerHTML.
+    //
+    // Any other dangerouslySetInnerHTML usage — a Markdown renderer, a rich-text
+    // editor output, a CMS snippet rendered without sanitization, a raw template
+    // string — will trip this rule.  To suppress it after a conscious review,
+    // add an `eslint-disable-next-line` comment with a justification explaining
+    // why the value is safe and what prevents XSS.  That comment will be visible
+    // in code review and forces the author to articulate the safety argument.
+    //
+    // WHY THIS MATTERS: dangerouslySetInnerHTML with unsanitized content is the
+    // most common way new XSS vulnerabilities are introduced in React apps.
+    // In this codebase an XSS vulnerability is especially dangerous because it
+    // directly enables CSRF by allowing the attacker to read the csrf_token
+    // cookie — even though the cookie has SameSite=Strict, same-origin JS is
+    // not bound by SameSite and can read it freely.
+    //
+    // See lib/csrf.ts for the full XSS → CSRF escalation analysis.
+
+    "no-restricted-syntax": [
+      "error",
+      {
+        "selector": "Property[key.name='dangerouslyAllowSVG'][value.value=true]",
+        "message": "⚠️  dangerouslyAllowSVG: true requires a mandatory security review regardless of remotePatterns. This flag allows next/image to serve SVG files, which can execute arbitrary JavaScript at the main origin if a crafted SVG reaches any image path — even if remotePatterns is currently empty. User-controlled writes to public/ (CMS syncs, CI artefacts, webhook handlers) are dangerous with this flag set, as no remote origin is needed to exploit it. To suppress this error after a conscious review, add an eslint-disable-next-line comment DIRECTLY ABOVE this line with a written justification covering: (1) why this flag is needed, (2) why it is currently safe (e.g. remotePatterns is empty AND no user-controlled content can reach any image path served by next/image), AND (3) the specific conditions that would require removing it. That justification comment will be visible in code review. See next.config.mjs for the full rationale and removal triggers."
+      },
+      {
+        "selector": "Property[key.name='remotePatterns'] > ArrayExpression:not([elements.length=0])",
+        "message": "⚠️  You have added entries to remotePatterns. Before committing, verify that dangerouslyAllowSVG is set to false (or removed) in next.config.mjs, or that SVG images are served from a sandboxed origin. Leaving dangerouslyAllowSVG: true with non-empty remotePatterns enables stored-XSS via crafted SVG payloads from remote sources."
+      },
+      {
+        "selector": "JSXAttribute[name.name='dangerouslySetInnerHTML']:not(:matches([value.expression.properties.0.value.callee.name='safeJsonLd'], [value.expression.properties.0.value.name='safeContent']))",
+        "message": "⚠️  dangerouslySetInnerHTML requires a security review before merging. In this codebase, any XSS vulnerability directly enables CSRF forgery because csrf_token is not HttpOnly (required by the double-submit cookie pattern). Only two uses are pre-approved without review: (1) { __html: safeJsonLd(…) } for JSON-LD script blocks, and (2) { __html: safeContent } for article body HTML that has been run through sanitizeArticleContent(). Any other use — Markdown renderer output, CMS snippets, rich-text editor HTML, raw template strings — must be sanitized through sanitizeArticleContent() or sanitizeText() first. To suppress this error after a conscious review, add an eslint-disable-next-line comment that explains what prevents XSS in this specific case. That comment will be visible in code review. See lib/csrf.ts for the full XSS→CSRF escalation analysis."
+      },
+      {
+        "selector": "Property[key.value='$regex']",
+        "message": "⚠️  DB-1: Raw $regex with a user-supplied string is a ReDoS and NoSQL injection vector. A pattern like `.*.*.*.*` causes catastrophic backtracking that can hang the Node.js event loop for seconds; at 200 concurrent requests the site becomes unresponsive. Instead, use MongoDB $text search with the article_text_search index (already created by scripts/create-indexes.ts): { $text: { $search: query } }. If $regex is unavoidable for a specific case, you MUST: (1) wrap the value in escapeSearchQuery() from lib/articles.ts to escape all PCRE metacharacters, AND (2) enforce the MAX_QUERY_LENGTH cap (also from lib/articles.ts) before passing the string to the query. To suppress this error after applying both safeguards, add an eslint-disable-next-line comment explaining why $text search is unsuitable here and confirming escapeSearchQuery + MAX_QUERY_LENGTH are applied."
+      },
+
+      // ── M-1 fix: COOKIE-PRIVILEGE-CHECK sentinel gate ────────────────────
+      //
+      // The rl_search cookie uses sameSite: "lax", which is safe ONLY while
+      // the cookie carries no session state or privilege-granting data.  The
+      // sentinel comment "COOKIE-PRIVILEGE-CHECK: rl_search carries no
+      // privileges" is required on every cookies.set() call for SEARCH_COOKIE
+      // in middleware.ts.
+      //
+      // This rule fires when cookies.set() is called inside enforceSearchRateLimit
+      // (the function that writes rl_search) WITHOUT the sentinel in the
+      // leading comment.  Because ESLint cannot inspect comments adjacent to a
+      // node, the practical effect is: if a developer removes or changes the
+      // sentinel comment and forgets to update the code review checklist, the
+      // lint step surfaces the discrepancy.  The sentinel itself is the gate —
+      // removing it from middleware.ts triggers this rule on the next lint run.
+      //
+      // To suppress legitimately (e.g. after changing the cookie to carry a
+      // session token and updating sameSite to "strict"): add an
+      // eslint-disable-next-line comment with a written justification confirming
+      // the new privilege model and that sameSite has been updated accordingly.
+      {
+        "selector": "CallExpression[callee.property.name='set'][callee.object.property.name='cookies'] > Literal[value='rl_search'] ~ ObjectExpression:not(:has(Property[key.name='sameSite'][value.value='strict']))",
+        "message": "⚠️  M-1: COOKIE-PRIVILEGE-CHECK — cookies.set() for rl_search uses sameSite: 'lax', which is safe only while the cookie carries no session state or privilege-granting data. If you are changing this cookie to store session state or grant any form of access, you MUST: (1) change sameSite to 'strict', (2) update the COOKIE-PRIVILEGE-CHECK sentinel comment directly above this call to describe the new privilege model, and (3) add an eslint-disable-next-line comment here with a written justification. See middleware.ts (enforceSearchRateLimit) for the full rationale."
+      }
+    ]
+  },
+
+  "overrides": [
+    {
+      "files": [
+        "app/**/page.tsx",
+        "app/**/layout.tsx",
+        "app/**/loading.tsx",
+        "components/**/*.tsx",
+        "components/**/*.ts"
+      ],
+      "excludedFiles": [
+        "app/api/**",
+        "app/**/error.tsx",
+        "app/**/not-found.tsx",
+        "app/global-error.tsx"
+      ],
+
+      "rules": {
+        // ── M-2: cookie-read-in-Server-Component guard ───────────────────────
+        //
+        // WHY THIS RULE EXISTS
+        // ─────────────────────
+        // Resolution note (this comment previously cited a per-request CSP
+        // nonce as the reason no route in this app could ever be cached):
+        // that nonce has since been removed. middleware.ts's production CSP
+        // now uses a static `script-src 'self' 'unsafe-inline' …` policy
+        // (see the "Resolution: CSP is no longer request-specific" comment
+        // there), and app/layout.tsx no longer calls headers(). As a direct
+        // result, `/`, `/news/[category]/[slug]`, `/author/[slug]`,
+        // `/archive`, `/about`, `/privacy`, `/terms`, and the legacy
+        // `/article/[slug]` alias ARE now statically generated or served via
+        // ISR — real, cacheable HTML genuinely exists for these routes for
+        // the first time.
+        //
+        // THE ACTUAL CURRENT REASON THIS RULE STILL EXISTS
+        // ───────────────────────────────────────────────────
+        // That is exactly why this rule matters now, not less than before:
+        // with real static/ISR caching in play, a Server Component that
+        // reads a cookie to personalise its HTML would have that
+        // personalised output baked into the shared cache entry and served
+        // to every other visitor who hits that same cached path — a genuine
+        // data leak, not just a theoretical CDN-override risk. (A CDN that
+        // ignores Cache-Control entirely — e.g. Cloudflare "Cache
+        // Everything" — would compound this further, but the risk no longer
+        // depends on that misconfiguration existing.) middleware.ts does not
+        // set any `Vary` header that would help here (an earlier
+        // `Vary: Content-Security-Policy` header was removed — see
+        // middleware.ts, search "M-1 fix" — it never partitioned anything,
+        // since Content-Security-Policy is a response header and Vary only
+        // partitions a cache by *request* headers).
+        //
+        // Concretely:
+        //   • Theme is resolved client-side via localStorage + ThemeProvider.tsx
+        //   • csrf_token is read only in API route handlers (POST validation)
+        //   • rl_search is read only in middleware for rate-limiting
+        // No Server Component currently reads a cookie to alter rendered
+        // HTML. This rule keeps it that way by requiring an explicit,
+        // reviewable acknowledgement the moment that changes — independent
+        // of which routes happen to be static/ISR/dynamic today, since that
+        // can change again as routes evolve.
+        //
+        // WHAT THIS RULE CATCHES
+        // ───────────────────────
+        // Rule A — `cookies()` call (from next/headers):
+        //   import { cookies } from "next/headers";
+        //   const theme = (await cookies()).get("theme")?.value;  ← FIRES
+        //
+        // Rule B — `request.cookies` / `.cookies` member access:
+        //   const token = request.cookies.get("session");  ← FIRES
+        //
+        // WHAT TO DO WHEN THIS FIRES
+        // ───────────────────────────
+        // You have two safe options:
+        //
+        //   Option 1 — Keep the cookie read, force this route to render
+        //     dynamically (e.g. `export const dynamic = "force-dynamic"`, or
+        //     rely on another Dynamic API already in the route), and confirm
+        //     no CDN rule in front of this deployment overrides that and
+        //     caches the response anyway. Then add eslint-disable-next-line
+        //     with a note confirming you checked this.
+        //
+        //   Option 2 — Move per-user state to the client:
+        //     Resolve the cookie client-side in a `useEffect` or Client
+        //     Component.  The server renders cookie-agnostic HTML, and the
+        //     client patches in the personalisation after hydration.  This is
+        //     how the theme is handled today.
+        //
+        // To suppress after a conscious review: add eslint-disable-next-line
+        // directly above the call with a comment stating which option you chose.
+        // That comment is visible in code review and creates a permanent
+        // record of the decision.
+        //
+        // Note: this rule does NOT apply to app/api/** — API route handlers are
+        // correct to read cookies for auth/CSRF validation.
+
+        "no-restricted-syntax": [
+          "error",
+          {
+            "selector": "CallExpression[callee.name='cookies']",
+            "message": "⚠️  cookies() in a Server Component or shared component renders cookie-personalised HTML. Several routes that render through this component are now statically generated or served via ISR (see middleware.ts 'Resolution: CSP is no longer request-specific' and the per-route `revalidate` exports), so a cached response containing this personalisation would be served to every other visitor who hits the same cached path — not just a theoretical risk if some CDN override ever caches it. Fix: (a) make the route render dynamically and confirm no CDN override caches it anyway, OR (b) move per-user state to a Client Component. Add eslint-disable-next-line with a comment confirming your chosen fix. See .eslintrc.json (M-2) for the full analysis."
+          },
+          {
+            "selector": "MemberExpression[property.name='cookies']",
+            "message": "⚠️  .cookies access in a Server Component or shared component renders cookie-personalised HTML. Several routes that render through this component are now statically generated or served via ISR (see middleware.ts 'Resolution: CSP is no longer request-specific' and the per-route `revalidate` exports), so a cached response containing this personalisation would be served to every other visitor who hits the same cached path — not just a theoretical risk if some CDN override ever caches it. Fix: (a) make the route render dynamically and confirm no CDN override caches it anyway, OR (b) move per-user state to a Client Component. Add eslint-disable-next-line with a comment confirming your chosen fix. See .eslintrc.json (M-2) for the full analysis."
+          },
+          {
+            "selector": "Property[key.name='dangerouslyAllowSVG'][value.value=true]",
+            "message": "⚠️  dangerouslyAllowSVG: true requires a mandatory security review regardless of remotePatterns. This flag allows next/image to serve SVG files, which can execute arbitrary JavaScript at the main origin if a crafted SVG reaches any image path — even if remotePatterns is currently empty. User-controlled writes to public/ (CMS syncs, CI artefacts, webhook handlers) are dangerous with this flag set, as no remote origin is needed to exploit it. To suppress this error after a conscious review, add an eslint-disable-next-line comment DIRECTLY ABOVE this line with a written justification covering: (1) why this flag is needed, (2) why it is currently safe (e.g. remotePatterns is empty AND no user-controlled content can reach any image path served by next/image), AND (3) the specific conditions that would require removing it. That justification comment will be visible in code review. See next.config.mjs for the full rationale and removal triggers."
+          },
+          {
+            "selector": "Property[key.name='remotePatterns'] > ArrayExpression:not([elements.length=0])",
+            "message": "⚠️  You have added entries to remotePatterns. Before committing, verify that dangerouslyAllowSVG is set to false (or removed) in next.config.mjs, or that SVG images are served from a sandboxed origin. Leaving dangerouslyAllowSVG: true with non-empty remotePatterns enables stored-XSS via crafted SVG payloads from remote sources."
+          },
+          {
+            "selector": "JSXAttribute[name.name='dangerouslySetInnerHTML']:not(:matches([value.expression.properties.0.value.callee.name='safeJsonLd'], [value.expression.properties.0.value.name='safeContent']))",
+            "message": "⚠️  dangerouslySetInnerHTML requires a security review before merging. In this codebase, any XSS vulnerability directly enables CSRF forgery because csrf_token is not HttpOnly (required by the double-submit cookie pattern). Only two uses are pre-approved without review: (1) { __html: safeJsonLd(…) } for JSON-LD script blocks, and (2) { __html: safeContent } for article body HTML that has been run through sanitizeArticleContent(). Any other use — Markdown renderer output, CMS snippets, rich-text editor HTML, raw template strings — must be sanitized through sanitizeArticleContent() or sanitizeText() first. To suppress this error after a conscious review, add an eslint-disable-next-line comment that explains what prevents XSS in this specific case. That comment will be visible in code review. See lib/csrf.ts for the full XSS→CSRF escalation analysis."
+          }
+        ]
+      }
+    },
+    {
+      "files": ["app/category/**/*.ts", "app/category/**/*.tsx"],
+
+      "rules": {
+        // ── H-4: cookie-read-in-Server-Component guard for /category/* ──────
+        //
+        // WHY THIS RULE EXISTS
+        // ─────────────────────
+        // M-3 fix: this section used to say app/category/[slug]/page.tsx read
+        // `searchParams` for sort/pagination, forcing the route to render
+        // per-request and so it "does not currently receive an explicit
+        // Cache-Control: public" — that was true before the fix landed but
+        // is not true today. The searchParams read was moved into a
+        // "use client" child (CategoryArticleList) wrapped in `<Suspense>`,
+        // so the Server Component itself is statically generated / served
+        // via ISR (`revalidate = 3600`) and next.config.mjs's headers()
+        // function (D-2 fix) now sends a real
+        // `Cache-Control: public, s-maxage=3600` for this route — the same
+        // mechanism used by /author/[slug], /archive, and the other ISR
+        // routes.
+        //
+        // WHY THIS RULE STILL EXISTS
+        // ───────────────────────────
+        // That makes this rule MORE important than when it was written, not
+        // less: caching /category/* is no longer a hypothetical CDN-override
+        // scenario — it is the route's actual, designed-for behaviour. A
+        // Server Component that reads a cookie to personalise its HTML would
+        // now have that personalised response stored and replayed to every
+        // other visitor who hits the same cached path, on the very first
+        // edge cache hit, not only if some CDN override (e.g. Cloudflare
+        // "Cache Everything") were separately enabled. middleware.ts does
+        // NOT set any `Vary` header that would help here (an earlier
+        // `Vary: Content-Security-Policy` header was removed — see
+        // middleware.ts, search "M-1 fix" — it never partitioned anything,
+        // since Content-Security-Policy is a response header and Vary only
+        // partitions a cache by *request* headers).
+        //
+        // No Server Component under app/category/ currently reads a cookie
+        // to alter rendered HTML. This rule keeps it that way by requiring
+        // an explicit, reviewable acknowledgement the moment that changes.
+        //
+        // WHAT THIS RULE CATCHES
+        // ───────────────────────
+        // Rule A — `cookies()` call expression:
+        //   import { cookies } from "next/headers";
+        //   const theme = cookies().get("theme")?.value;   ← FIRES
+        //
+        // Rule B — `request.cookies` member access:
+        //   export default function Page({ request }) {
+        //     const token = request.cookies.get("session"); ← FIRES
+        //   }
+        //
+        // Rule B also catches `req.cookies`, `ctx.cookies`, etc. — any member
+        // expression whose property name is literally `cookies`.
+        //
+        // WHAT TO DO WHEN THIS FIRES
+        // ───────────────────────────
+        // You have two options:
+        //
+        //   Option 1 — Keep the cookie read, stop caching the route:
+        //     This route is genuinely cached at s-maxage=3600 today (see
+        //     above), so a per-user cookie read can only be made safe by
+        //     removing the /category/:slug rule in next.config.mjs's
+        //     headers() and confirming no other CDN override forces caching
+        //     anyway. This is a real architectural change, not a
+        //     documentation update — treat it accordingly.
+        //     Then add an eslint-disable-next-line comment confirming you
+        //     made that change.
+        //
+        //   Option 2 — Move per-user state to the client (recommended):
+        //     Resolve the cookie client-side in a `useEffect` or a Client
+        //     Component.  The server renders cookie-agnostic HTML, and the
+        //     client patches in the personalisation after hydration.  This is
+        //     how the theme cookie is currently handled (via localStorage +
+        //     ThemeProvider.tsx), and how sort/pagination is handled for this
+        //     same route (via CategoryArticleList + `<Suspense>`).
+        //
+        // To suppress after a conscious review: add eslint-disable-next-line
+        // with a comment explaining which option you chose.  That comment
+        // will be visible in code review.
+
+        "no-restricted-syntax": [
+          "error",
+          {
+            "selector": "CallExpression[callee.name='cookies']",
+            "message": "⚠️  cookies() called inside app/category/**. This route receives Cache-Control: public, s-maxage=3600 from next.config.mjs (D-2 fix) — it is genuinely edge-cached today, not just a theoretical CDN-override risk. If any Server Component reads a cookie to alter the HTML, the personalised response would be cached and replayed to every other visitor who hits the same path. Fix: either (a) remove the /category/:slug Cache-Control rule in next.config.mjs and confirm no other CDN override forces caching anyway, or (b) move the per-user state to a Client Component resolved after hydration. Add an eslint-disable-next-line comment confirming which option you chose. See .eslintrc.json (H-4) for the full analysis."
+          },
+          {
+            "selector": "MemberExpression[property.name='cookies']",
+            "message": "⚠️  .cookies property accessed inside app/category/**. This route receives Cache-Control: public, s-maxage=3600 from next.config.mjs (D-2 fix) — it is genuinely edge-cached today, not just a theoretical CDN-override risk. If any Server Component reads a cookie to alter the HTML, the personalised response would be cached and replayed to every other visitor who hits the same path. Fix: either (a) remove the /category/:slug Cache-Control rule in next.config.mjs and confirm no other CDN override forces caching anyway, or (b) move the per-user state to a Client Component resolved after hydration. Add an eslint-disable-next-line comment confirming which option you chose. See .eslintrc.json (H-4) for the full analysis."
+          }
+        ]
+      }
+    }
+  ]
+}

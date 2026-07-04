@@ -1,0 +1,250 @@
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --accent: #C41E3A;
+  --accent-dark: #A01830;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    /* Mobile: only the main header bar (h-16 = 64px) is sticky. Add 8px breathing room. */
+    scroll-padding-top: 4.5rem; /* 72px */
+    /* Tailwind Preflight sets -webkit-text-size-adjust but not the unprefixed
+       standard property; add it explicitly for spec compliance. */
+    text-size-adjust: 100%;
+  }
+
+  /* Desktop: top bar (h-9=36px) + main header (h-16=64px) + nav bar (~44px) = 144px. Add 8px breathing room. */
+  @media (min-width: 1024px) {
+    html {
+      scroll-padding-top: 9.5rem; /* 152px */
+    }
+  }
+
+  body {
+    @apply font-sans text-ink bg-paper antialiased;
+    font-feature-settings: "kern" 1, "liga" 1;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-serif;
+  }
+
+  a, button, input, select, textarea, [role="button"] {
+    @apply transition-colors duration-150;
+  }
+
+  ::selection {
+    @apply bg-accent/20 text-accent-dark;
+  }
+}
+
+@layer components {
+  /* Article body content typography */
+  .article-body {
+    @apply font-sans text-[17px] leading-[1.85] text-ink;
+  }
+
+  .article-body p {
+    @apply mb-6;
+  }
+
+  .article-body h2 {
+    @apply text-2xl font-serif font-bold mt-10 mb-4 text-ink border-l-4 border-accent pl-4;
+  }
+
+  .article-body h3 {
+    @apply text-xl font-serif font-bold mt-8 mb-3 text-ink;
+  }
+
+  .article-body blockquote {
+    @apply border-l-4 border-accent pl-6 my-8 italic text-ink-secondary text-lg;
+  }
+
+  .article-body ul, .article-body ol {
+    @apply mb-6 pl-6;
+  }
+
+  .article-body li {
+    @apply mb-2;
+  }
+
+  .article-body ul li {
+    @apply list-disc;
+  }
+
+  .article-body ol li {
+    @apply list-decimal;
+  }
+
+  .article-body a {
+    @apply text-accent underline underline-offset-2 hover:text-accent-dark;
+  }
+
+  .article-body em {
+    @apply italic;
+  }
+
+  .article-body strong {
+    @apply font-semibold;
+  }
+
+  /* Breaking news ticker */
+  .ticker-content {
+    display: inline-block;
+    white-space: nowrap;
+    animation: ticker 30s linear infinite;
+  }
+
+  .ticker-content:hover {
+    animation-play-state: paused;
+  }
+
+  @keyframes ticker {
+    0% { transform: translateX(100%); }
+    100% { transform: translateX(-100%); }
+  }
+
+  /* Dark mode overrides */
+  .dark body {
+    @apply bg-zinc-950 text-zinc-100;
+  }
+
+  /* Category label */
+  .category-label {
+    @apply inline-block text-xs font-sans font-semibold uppercase tracking-widest text-accent;
+  }
+
+  /* Article card hover */
+  .article-card {
+    @apply group cursor-pointer;
+  }
+
+  .article-card:hover .card-headline {
+    @apply text-accent;
+  }
+
+  /* Skeleton loading */
+  .skeleton {
+    @apply bg-paper-secondary animate-pulse rounded;
+  }
+
+  .dark .skeleton {
+    @apply bg-zinc-800;
+  }
+
+  /* Section divider */
+  .section-divider {
+    @apply border-t border-border dark:border-border-dark my-8;
+  }
+
+  /* Sticky header shadow */
+  .header-scrolled {
+    box-shadow: 0 1px 0 rgba(0,0,0,0.1);
+  }
+
+/* Reading progress bar element (H-2: width set via CSS custom property --rp-width) */
+.reading-progress-bar {
+  @apply fixed top-0 left-0 h-0.5 bg-accent z-50 transition-all duration-100;
+  width: var(--rp-width, 0%);
+}
+
+/* Author avatar monogram fallback (H-2: size set via --av-size / --av-font) */
+.author-avatar-monogram {
+  width: var(--av-size, 40px);
+  height: var(--av-size, 40px);
+  font-size: var(--av-font, 15.2px);
+}
+
+  /* Reading progress bar (legacy class — kept for backwards compat) */
+  .reading-progress {
+    @apply fixed top-0 left-0 h-0.5 bg-accent z-50 transition-all;
+  }
+
+  /* Back to top */
+  .back-to-top {
+    @apply fixed bottom-8 right-8 z-40 w-10 h-10 bg-ink text-paper flex items-center justify-center
+           opacity-0 translate-y-4 transition-all duration-300;
+  }
+
+  .back-to-top.visible {
+    @apply opacity-100 translate-y-0;
+  }
+
+  /* Newsletter input */
+  .newsletter-input {
+    @apply w-full border border-border dark:border-border-dark bg-transparent px-3 py-2 text-sm
+           focus:outline-none focus:border-accent transition-colors;
+  }
+
+  /* Breaking badge */
+  .breaking-badge {
+    @apply bg-accent text-white text-[10px] font-sans font-bold uppercase tracking-widest px-2 py-0.5;
+  }
+}
+
+/* Dark mode specifics */
+.dark .article-body {
+  @apply text-zinc-200;
+}
+
+.dark .article-body h2 {
+  @apply text-zinc-100;
+}
+
+.dark .article-body h3 {
+  @apply text-zinc-100;
+}
+
+/* Text size controls */
+.text-size-sm .article-body { font-size: 15px; }
+.text-size-md .article-body { font-size: 17px; }
+.text-size-lg .article-body { font-size: 19px; }
+.text-size-xl .article-body { font-size: 21px; }
+
+/* Reading mode */
+.reading-mode {
+  @apply max-w-2xl mx-auto;
+}
+
+.reading-mode .article-sidebar {
+  @apply hidden;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-paper-secondary;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-ink-muted;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-ink-tertiary;
+}
+
+/* Print styles */
+@media print {
+  .no-print { display: none !important; }
+}
+
+/* Honeypot fields — hidden from users, filled only by bots.
+ *
+ * Using a named CSS class rather than an inline style= attribute keeps this
+ * compatible with the strict `style-src 'self'` CSP (no 'unsafe-inline').
+ * The !important ensures this wins over any cascade, and the class name is
+ * deliberately explicit so future developers understand the intent.
+ *
+ * All honeypot inputs also carry className="hidden" (Tailwind) as a primary
+ * layer; this class is the CSS-file fallback if the Tailwind stylesheet fails
+ * to load (Cloudflare edge error, blocked CDN, slow-connection race, etc.).
+ */
+.honeypot {
+  display: none !important;
+}

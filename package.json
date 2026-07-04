@@ -1,0 +1,47 @@
+{
+  "name": "faulter",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "archive": "git archive HEAD --output=faulter.zip",
+    "prebuild": "node scripts/verify-lockfile.mjs && next lint && node scripts/check-env.mjs && node scripts/audit-svg.mjs",
+    "check-env": "node scripts/check-env.mjs",
+    "check-env:ci": "node --env-file-if-exists=/dev/null scripts/check-env.mjs",
+    "audit-svg": "node scripts/audit-svg.mjs",
+    "create-indexes": "tsx --conditions=react-server --env-file-if-exists=.env.local scripts/create-indexes.ts"
+  },
+  "dependencies": {
+    "@marsidev/react-turnstile": "^0.7.2",
+    "@types/sanitize-html": "^2.16.1",
+    "@vercel/functions": "^3.7.1",
+    "clsx": "^2.1.1",
+    "mongodb": "^6.13.1",
+    "next": "15.5.18",
+    "react": "^19",
+    "react-dom": "^19",
+    "resend": "^4.5.1",
+    "sanitize-html": "^2.17.4",
+    "server-only": "^0.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "autoprefixer": "^10.0.1",
+    "eslint": "^8",
+    "eslint-config-next": "15.5.18",
+    "postcss": "^8",
+    "tailwindcss": "^3.4.1",
+    "tsx": "^4.8.1",
+    "typescript": "^5"
+  },
+  "overrides": {
+    "next": {
+      "postcss": "^8.5.10"
+    }
+  }
+}

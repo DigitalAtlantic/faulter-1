@@ -1,0 +1,189 @@
+# SVG configuration safety check — runs on every push and pull request.
+#
+# H-2: dangerouslyAllowSVG: true + non-empty remotePatterns = stored-XSS risk
+# ─────────────────────────────────────────────────────────────────────────────
+# next.config.mjs sets dangerouslyAllowSVG: true so that next/image can serve
+# the committed SVG assets under /public. This is safe ONLY while remotePatterns
+# stays empty — i.e. next/image never proxies third-party URLs.
+#
+# If remotePatterns ever becomes non-empty while dangerouslyAllowSVG is still
+# true, next/image can proxy remote SVGs. A crafted SVG from any remotePattern
+# origin will execute JavaScript at the main faulter.news origin with full
+# same-origin access, bypassing the nonce-based CSP entirely (SVGs served as
+# images are not subject to the page's CSP).
+#
+# The ESLint rule in .eslintrc.json guards against this during development and
+# in a lint CI step. This workflow adds a second, independent check that runs
+# on EVERY push and pull request — even when the lint step is skipped or
+# suppressed — so the dangerous combination can never silently reach main.
+#
+# WHY A SEPARATE WORKFLOW (not just ESLint)?
+#   • ESLint can be bypassed with eslint-disable comments or by skipping the
+#     lint step entirely.
+#   • This script check cannot be disabled by a source-code comment — it is a
+#     hard CI gate that fails the PR regardless of any in-file suppressions.
+#   • The two layers together make it very difficult to accidentally or
+#     intentionally ship the dangerous combination.
+#
+# WHAT THIS CHECKS
+# ─────────────────
+# The script performs two independent grep checks on next.config.mjs:
+#
+#   CHECK A — remotePatterns non-empty:
+#     Looks for any remotePatterns array entry that is NOT the empty array [].
+#     A match means at least one remote origin has been added.
+#
+#   CHECK B — dangerouslyAllowSVG: true:
+#     Looks for the flag in any uncommented line (lines not starting with //).
+#     An eslint-disable comment in the source does NOT satisfy this check.
+#
+#   If BOTH are true simultaneously: fail with an actionable error message.
+#   If only one is true: pass (adding remotePatterns alone is not dangerous;
+#   dangerouslyAllowSVG alone with remotePatterns: [] is the current safe state).
+#
+# WHAT TO DO WHEN THIS FAILS
+# ───────────────────────────
+# You have three safe options:
+#
+#   Option 1 — Set dangerouslyAllowSVG: false (recommended for CMS/CDN setups):
+#     Serve article images from a sandboxed subdomain (images.faulter.news) or
+#     an R2/S3 bucket.  next/image can proxy them safely because SVGs served
+#     from a separate origin cannot access the main-origin DOM.
+#     See the S-1 milestone in next.config.mjs for the full migration guide.
+#
+#   Option 2 — Keep dangerouslyAllowSVG: true but restrict remotePatterns:
+#     Only add remotePatterns entries for origins that exclusively serve
+#     raster images (JPEG, PNG, WebP, AVIF) — never SVGs.  Add a
+#     contentSecurityPolicy: "script-src 'none'; sandbox" to the images block
+#     to enforce this at the browser level, and document the restriction in
+#     a comment above the remotePatterns entry.  Then update this workflow's
+#     SAFE_COMBINATION_REASON env var with your written justification.
+#
+#   Option 3 — Convert all SVGs in /public to raster format:
+#     Once no .svg files are served via next/image, dangerouslyAllowSVG: true
+#     has no effect and can be removed entirely.
+
+name: SVG config safety check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check-dangerous-svg-config:
+    name: dangerouslyAllowSVG + remotePatterns safety check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for dangerous dangerouslyAllowSVG + remotePatterns combination
+        run: |
+          CONFIG="next.config.mjs"
+
+          if [ ! -f "$CONFIG" ]; then
+            echo "::notice::$CONFIG not found — skipping SVG config check."
+            exit 0
+          fi
+
+          # ── CHECK A: remotePatterns non-empty ──────────────────────────────
+          # Match any line that contains a non-empty remotePatterns array.
+          # We look for `remotePatterns:` followed by content that is NOT `[]`
+          # (accounting for possible whitespace).
+          #
+          # This is a heuristic: it catches the common single-line form
+          #   remotePatterns: [{ protocol: "https", hostname: "cdn.example.com" }]
+          # and the multi-line open-bracket form
+          #   remotePatterns: [
+          #     { ... }
+          #
+          # It does NOT catch every possible AST shape, which is acceptable:
+          # the ESLint rule handles deep AST analysis; this script handles the
+          # common cases and acts as an independent safety net.
+          HAS_REMOTE_PATTERNS=false
+          if grep -qP 'remotePatterns\s*:\s*\[(?!\s*\])' "$CONFIG"; then
+            HAS_REMOTE_PATTERNS=true
+          fi
+
+          # ── CHECK B: dangerouslyAllowSVG: true (uncommented) ───────────────
+          # Match lines that are NOT pure comments (// …) and contain the flag.
+          # An eslint-disable comment in the source does not satisfy this check
+          # because it is a separate comment line, not part of the value line.
+          HAS_DANGEROUS_SVG=false
+          if grep -v '^\s*//' "$CONFIG" | grep -q 'dangerouslyAllowSVG\s*:\s*true'; then
+            HAS_DANGEROUS_SVG=true
+          fi
+
+          echo "remotePatterns non-empty : $HAS_REMOTE_PATTERNS"
+          echo "dangerouslyAllowSVG: true: $HAS_DANGEROUS_SVG"
+
+          if [ "$HAS_REMOTE_PATTERNS" = "true" ] && [ "$HAS_DANGEROUS_SVG" = "true" ]; then
+            echo ""
+            echo "::error::SECURITY: next.config.mjs has both dangerouslyAllowSVG: true AND"
+            echo "::error::non-empty remotePatterns. This combination allows next/image to proxy"
+            echo "::error::remote SVGs, which execute JavaScript at the main origin and bypass CSP."
+            echo ""
+            echo "Fix options (see .github/workflows/svg-config-check.yml for full details):"
+            echo "  1. Set dangerouslyAllowSVG: false and serve images from a sandboxed subdomain."
+            echo "  2. Keep dangerouslyAllowSVG: true but ensure remotePatterns only includes"
+            echo "     origins that NEVER serve SVGs, and add contentSecurityPolicy: sandbox."
+            echo "  3. Convert all SVGs in /public to raster format and remove the flag."
+            echo ""
+            echo "See next.config.mjs (removal triggers A–C and S-1 milestone) for the full guide."
+            exit 1
+          fi
+
+          echo "✅ SVG config check passed — no dangerous combination detected."
+
+      # ── H-3 fix: enforce SVG_CDN_TICKET sentinel ─────────────────────────
+      #
+      # next.config.mjs contains the sentinel comment:
+      #
+      #   SVG_CDN_TICKET: UNTRACKED
+      #
+      # which must be replaced with a real ticket ID before any CMS integration,
+      # file-upload feature, or remotePatterns change is merged.  The comment in
+      # next.config.mjs described this CI step but did not implement it — this
+      # step is the actual enforcement gate.
+      #
+      # This check runs unconditionally on every push and PR so that:
+      #   (a) a developer cannot forget to create and link the tracking ticket
+      #       before starting CMS work, and
+      #   (b) the check cannot be bypassed by a source-code comment or by
+      #       skipping the ESLint step.
+      #
+      # To pass this check: replace "UNTRACKED" in next.config.mjs with the
+      # real ticket ID (e.g. "GH-42", "JIRA-123", "LINEAR-456") once the CDN
+      # migration ticket has been created.
+      - name: Reject untracked SVG CDN milestone
+        run: |
+          CONFIG="next.config.mjs"
+
+          if [ ! -f "$CONFIG" ]; then
+            echo "::notice::$CONFIG not found — skipping SVG_CDN_TICKET sentinel check."
+            exit 0
+          fi
+
+          if grep -q "SVG_CDN_TICKET: UNTRACKED" "$CONFIG"; then
+            echo ""
+            echo "::error::SECURITY: next.config.mjs still contains 'SVG_CDN_TICKET: UNTRACKED'."
+            echo "::error::dangerouslyAllowSVG: true is safe today but will become an active"
+            echo "::error::stored-XSS vector the moment any CMS integration, file-upload feature,"
+            echo "::error::or remotePatterns entry is added."
+            echo ""
+            echo "Required action before merging any such change:"
+            echo "  1. Create a backlog ticket titled:"
+            echo "       'Migrate article images to CDN subdomain (prerequisite for"
+            echo "        disabling dangerouslyAllowSVG)'"
+            echo "  2. Replace 'UNTRACKED' in next.config.mjs with the ticket ID"
+            echo "     (e.g. GH-42, JIRA-123, LINEAR-456)."
+            echo "  3. Resolve that ticket (or set dangerouslyAllowSVG: false) before"
+            echo "     merging any commit that satisfies TRIGGER A, B, or C in"
+            echo "     next.config.mjs."
+            echo ""
+            echo "See next.config.mjs (S-1 milestone section) for full acceptance criteria."
+            exit 1
+          fi
+
+          echo "✅ SVG_CDN_TICKET sentinel check passed — ticket is tracked."

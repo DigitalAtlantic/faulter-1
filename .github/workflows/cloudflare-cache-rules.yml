@@ -1,0 +1,379 @@
+# Cloudflare cache-eligibility rules — automated Terraform apply
+#
+# Root cause fix for audit Finding C-1 (Critical):
+# "Cloudflare Cache Eligibility Rule Has Never Been Applied"
+#
+# infra/cloudflare/cache_rules.tf has been correctly written since the audit
+# but was NEVER applied to the zone — there was no automation to do so.
+# This workflow closes that gap.  Every push to main that touches
+# infra/cloudflare/** now runs terraform apply automatically, and a
+# workflow_dispatch input lets any operator apply it on demand without a
+# code change (e.g. after rotating the Cloudflare API token or after
+# verifying the zone ID).
+#
+# How the idempotency works:
+#   terraform apply is safe to run repeatedly. The two cloudflare_ruleset
+#   resources use stable `ref` values on each rule, so a second apply does
+#   not create duplicates — it updates the same named rules in place.
+#   Running this on every relevant push is therefore harmless.
+#
+# C-1 root-cause closure — CLOUDFLARE_CACHE_RULES_APPLIED:
+#   next.config.mjs has a build-time gate that hard-fails production builds
+#   unless CLOUDFLARE_CACHE_RULES_APPLIED=true is set in the Vercel project's
+#   Production environment variables.  Previously, the .env.example comment
+#   said this was a deliberate manual step ("so an operator explicitly
+#   acknowledges the rules are live").  In practice, that reliance on a manual
+#   step is EXACTLY what allowed the cache rules to remain unapplied — the
+#   same human-process gap that caused the audit finding.
+#
+#   This workflow now sets CLOUDFLARE_CACHE_RULES_APPLIED=true in Vercel
+#   automatically after a verified successful terraform apply, using the
+#   Vercel REST API.  The manual step is eliminated:
+#     1. Push to main (or trigger workflow_dispatch).
+#     2. Terraform applies the Cloudflare Cache Rules to the zone.
+#     3. This workflow verifies the rules are live via the Cloudflare API.
+#     4. This workflow calls the Vercel API to upsert
+#        CLOUDFLARE_CACHE_RULES_APPLIED=true on the Production environment.
+#     5. The next Vercel deploy sees the variable and the build gate passes.
+#
+# Required GitHub repository secrets (Settings → Secrets → Actions):
+#   CLOUDFLARE_ZONE_ID    — the zone ID for the production domain
+#                            (Cloudflare dashboard → Overview → right-hand panel)
+#   CLOUDFLARE_API_TOKEN  — a token scoped to Zone → Cache Rules → Edit
+#                            for this zone only. Do NOT reuse
+#                            CLOUDFLARE_PURGE_API_TOKEN (that token only needs
+#                            Zone → Cache Purge → Edit and must stay separate).
+#                            Create at: https://dash.cloudflare.com/profile/api-tokens
+#   VERCEL_TOKEN          — a Vercel personal access token or team token with
+#                            permission to read/write project environment variables.
+#                            Create at: https://vercel.com/account/tokens
+#                            Scope: full account or the specific team that owns
+#                            the project. "Read and write" access is required.
+#   VERCEL_PROJECT_ID     — the Vercel project ID (Settings → General → Project ID
+#                            in the Vercel dashboard, or from `vercel inspect`).
+#   VERCEL_TEAM_ID        — the Vercel team ID if the project belongs to a team
+#                            (Settings → General → Team ID). Leave blank / unset
+#                            for personal accounts; the step handles both cases.
+#
+# If any required secret is missing the job fails loudly so the gap is visible
+# rather than silently skipped.  This is intentional: a missing secret means
+# the rule is not applied, which is the exact failure mode this workflow exists
+# to prevent.
+
+name: Apply Cloudflare cache rules (Terraform)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "infra/cloudflare/**"
+  # Allow any operator to trigger a manual apply from the Actions tab —
+  # useful after a token rotation, after a zone ID change, or to
+  # force-reapply without making a dummy commit.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  terraform-apply:
+    name: terraform apply — Cloudflare cache rules
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: infra/cloudflare
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets are present
+        # Run from repo root — not infra/cloudflare — so the working-directory
+        # default does not apply here.
+        working-directory: ${{ github.workspace }}
+        run: |
+          missing=()
+          if [ -z "${{ secrets.CLOUDFLARE_ZONE_ID }}" ]; then
+            missing+=("CLOUDFLARE_ZONE_ID")
+          fi
+          if [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]; then
+            missing+=("CLOUDFLARE_API_TOKEN")
+          fi
+          if [ -z "${{ secrets.VERCEL_TOKEN }}" ]; then
+            missing+=("VERCEL_TOKEN")
+          fi
+          if [ -z "${{ secrets.VERCEL_PROJECT_ID }}" ]; then
+            missing+=("VERCEL_PROJECT_ID")
+          fi
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Required secrets are not configured: ${missing[*]}"
+            echo "::error::Without these, the Cloudflare cache-eligibility rules"
+            echo "::error::cannot be applied and/or CLOUDFLARE_CACHE_RULES_APPLIED"
+            echo "::error::cannot be set in Vercel, leaving every HTML route uncached"
+            echo "::error::(0% cache hit ratio — audit Finding C-1)."
+            echo ""
+            echo "Fix: add the missing secrets under"
+            echo "Settings → Secrets and variables → Actions → New repository secret."
+            echo ""
+            echo "  CLOUDFLARE_ZONE_ID   — your zone ID (Cloudflare dashboard → Overview)"
+            echo "  CLOUDFLARE_API_TOKEN — scoped to Zone → Cache Rules → Edit for this zone"
+            echo "                         See infra/cloudflare/README.md for full instructions."
+            echo "  VERCEL_TOKEN         — personal access token (vercel.com/account/tokens)"
+            echo "                         Needs read/write access to project env vars."
+            echo "  VERCEL_PROJECT_ID    — Vercel project ID (Vercel dashboard → Settings → General)"
+            echo "  VERCEL_TEAM_ID       — Vercel team ID (optional; only needed for team projects)"
+            exit 1
+          fi
+          echo "✅ All required secrets are present."
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          # Pin to a recent stable release. Update this when upgrading the
+          # Cloudflare provider — check the required_version constraint in
+          # infra/cloudflare/provider.tf first.
+          terraform_version: "1.9.8"
+
+      - name: terraform init
+        env:
+          TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: terraform init -input=false
+
+      - name: terraform validate
+        run: terraform validate
+
+      - name: terraform plan
+        id: plan
+        env:
+          TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          terraform plan \
+            -input=false \
+            -out=tfplan \
+            -detailed-exitcode
+        # Exit codes: 0 = no changes, 1 = error, 2 = changes pending
+        # Treat all non-error exits as success here; apply handles the rest.
+        continue-on-error: true
+
+      - name: Fail on plan error
+        if: steps.plan.outcome == 'failure' && steps.plan.outputs.exitcode == '1'
+        run: |
+          echo "::error::terraform plan failed. Review the output above."
+          exit 1
+
+      - name: terraform apply
+        env:
+          TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            tfplan
+        # auto-approve is safe here because:
+        #   1. We only reach this step after a successful plan.
+        #   2. This workflow only runs on pushes to main and workflow_dispatch —
+        #      a human has already reviewed and merged the cache_rules.tf change.
+        #   3. The apply is idempotent: running it on an already-applied ruleset
+        #      produces no change (Cloudflare provider updates in place via `ref`).
+
+      - name: Confirm rules are live
+        id: verify_rules
+        env:
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          echo "Verifying rules were written to the zone…"
+          RESPONSE=$(curl -sf \
+            "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/rulesets/phases/http_request_cache_settings/entrypoint" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json")
+
+          ALL_LIVE=true
+
+          if echo "$RESPONSE" | grep -q '"cache_eligible_public_routes"'; then
+            echo "✅ cache_eligible_public_routes rule is live on the zone."
+          else
+            echo "::warning::cache_eligible_public_routes ref not found in zone ruleset."
+            echo "::warning::The apply appeared to succeed but the expected rule is missing."
+            echo "::warning::Check the Cloudflare dashboard under Caching → Cache Rules."
+            echo "$RESPONSE"
+            ALL_LIVE=false
+          fi
+
+          if echo "$RESPONSE" | grep -q '"bypass_api_and_search"'; then
+            echo "✅ bypass_api_and_search rule is live on the zone."
+          else
+            echo "::warning::bypass_api_and_search ref not found in zone ruleset."
+            echo "$RESPONSE"
+            ALL_LIVE=false
+          fi
+
+          # Verify the cache-key normalisation rule for /category/* and /tag/*
+          # is also live (bullet-3 High fix). This rule strips `sort` and `page`
+          # from the Cloudflare cache key so that /category/world?sort=oldest&page=3
+          # shares a cache entry with /category/world rather than creating an
+          # independent cold-start miss for every (sort, page) permutation.
+          #
+          # This rule is part of the single cloudflare_ruleset.edge_cache_eligibility
+          # resource (all cache-settings rules are merged into one resource because
+          # Cloudflare allows only one zone-level ruleset per phase). Its ref value
+          # is checked against the same phase entrypoint response used above.
+          if echo "$RESPONSE" | grep -q '"strip_sort_page_from_category_tag_cache_key"'; then
+            echo "✅ strip_sort_page_from_category_tag_cache_key rule is live on the zone."
+          else
+            echo "::warning::strip_sort_page_from_category_tag_cache_key ref not found in zone ruleset."
+            echo "::warning::Cache-key normalisation for /category/* and /tag/* is NOT active."
+            echo "::warning::Every (sort, page) combination creates a separate Cloudflare cache"
+            echo "::warning::entry, fragmenting the ISR cache across the full sort×page matrix."
+            echo "::warning::Check the Cloudflare dashboard under Caching → Cache Rules."
+            echo "$RESPONSE"
+            ALL_LIVE=false
+          fi
+
+          # Verify the /search cache-key normalisation rule is live (High severity fix).
+          # This rule strips the q param from the Cloudflare cache key for /search so
+          # that /search?q=foo and /search?q=bar share the same static shell cache entry.
+          # Without it every unique search query is a guaranteed cold miss, fragmenting
+          # the cache across the full cardinality of user search terms.
+          if echo "$RESPONSE" | grep -q '"strip_q_from_search_cache_key"'; then
+            echo "✅ strip_q_from_search_cache_key rule is live on the zone."
+          else
+            echo "::warning::strip_q_from_search_cache_key ref not found in zone ruleset."
+            echo "::warning::Cache-key normalisation for /search is NOT active."
+            echo "::warning::Every unique ?q= value creates a separate Cloudflare cache entry,"
+            echo "::warning::guaranteeing a MISS on every first-time query instead of sharing"
+            echo "::warning::the single static shell entry."
+            echo "::warning::Check the Cloudflare dashboard under Caching → Cache Rules."
+            echo "$RESPONSE"
+            ALL_LIVE=false
+          fi
+
+          # Export the verification result so the next step can decide whether
+          # to set the Vercel env var.  We only assert CLOUDFLARE_CACHE_RULES_APPLIED=true
+          # in Vercel when ALL expected rules are confirmed present in the zone.
+          # If any rule is missing we still warn (not error) here — the previous
+          # steps already hard-failed on a terraform error; a missing ref after a
+          # successful apply is an anomaly that warrants investigation without
+          # blocking the workflow entirely.
+          echo "all_live=${ALL_LIVE}" >> "$GITHUB_OUTPUT"
+
+      # ── C-1 root-cause closure ──────────────────────────────────────────────
+      # This is the step that was missing and caused the audit finding.
+      #
+      # next.config.mjs gates production builds on CLOUDFLARE_CACHE_RULES_APPLIED=true
+      # being present in the Vercel project's Production environment.  Without this
+      # step the terraform apply above has no way to signal to Vercel that the rules
+      # are live, and every production build hard-fails (process.exit(1)).
+      #
+      # The Vercel REST API upsert pattern used here:
+      #   1. GET /v9/projects/{id}/env?target=production to find any existing var.
+      #   2. If found: PATCH /v9/projects/{id}/env/{envId} to update the value.
+      #   3. If not found: POST /v9/projects/{id}/env to create it.
+      #
+      # Why POST + PATCH instead of just POST:
+      #   Vercel returns 409 Conflict if you POST a key that already exists.
+      #   An idempotent upsert avoids this and is safe to run on every apply.
+      #
+      # The step is conditional on all_live=true from the previous verify step.
+      # If the verification found a missing rule (implying the apply may not have
+      # fully succeeded), we do NOT set the flag in Vercel — a false-positive
+      # confirmation would suppress the build-gate warning that protects against
+      # this exact failure mode.
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Set CLOUDFLARE_CACHE_RULES_APPLIED=true in Vercel (C-1 fix)
+        if: steps.verify_rules.outputs.all_live == 'true'
+        working-directory: ${{ github.workspace }}
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          # VERCEL_TEAM_ID is optional — only needed for team-owned projects.
+          # If your project is under a personal account, leave this secret unset
+          # (or set it to an empty string) and the teamId query param is omitted.
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+        run: |
+          echo "Setting CLOUDFLARE_CACHE_RULES_APPLIED=true in Vercel Production environment…"
+
+          # Build the optional teamId query param.
+          # If VERCEL_TEAM_ID is empty, omit it entirely — the Vercel API
+          # distinguishes "no teamId" (personal account) from "teamId=" (invalid).
+          TEAM_PARAM=""
+          if [ -n "${VERCEL_TEAM_ID}" ]; then
+            TEAM_PARAM="?teamId=${VERCEL_TEAM_ID}"
+          fi
+
+          BASE_URL="https://api.vercel.com/v9/projects/${VERCEL_PROJECT_ID}/env"
+
+          # Step 1: fetch existing Production env vars to find the ID if the
+          # variable already exists.  We filter by key name client-side because
+          # the Vercel API doesn't support filtering by key in the list endpoint.
+          LIST_RESPONSE=$(curl -sf \
+            "${BASE_URL}${TEAM_PARAM}" \
+            -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+            -H "Content-Type: application/json")
+
+          if [ $? -ne 0 ]; then
+            echo "::error::Failed to list Vercel environment variables."
+            echo "::error::Check that VERCEL_TOKEN is valid and VERCEL_PROJECT_ID is correct."
+            exit 1
+          fi
+
+          # Extract the env var ID for CLOUDFLARE_CACHE_RULES_APPLIED targeting production.
+          # jq filters to entries where key == target key AND "production" is in the targets array.
+          EXISTING_ID=$(echo "$LIST_RESPONSE" | \
+            jq -r '.envs[] | select(.key == "CLOUDFLARE_CACHE_RULES_APPLIED" and (.target | index("production") != null)) | .id' \
+            2>/dev/null || true)
+
+          if [ -n "${EXISTING_ID}" ]; then
+            # Step 2a: variable exists — PATCH to update the value.
+            # This is idempotent: patching "true" -> "true" is a no-op on the Vercel side.
+            echo "  Existing env var found (id: ${EXISTING_ID}). Updating via PATCH…"
+            PATCH_RESPONSE=$(curl -sf -X PATCH \
+              "${BASE_URL}/${EXISTING_ID}${TEAM_PARAM}" \
+              -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{"value":"true","type":"plain","target":["production"]}')
+
+            if [ $? -ne 0 ]; then
+              echo "::error::PATCH to update CLOUDFLARE_CACHE_RULES_APPLIED failed."
+              echo "::error::Response: ${PATCH_RESPONSE}"
+              exit 1
+            fi
+            echo "✅ CLOUDFLARE_CACHE_RULES_APPLIED updated to 'true' in Vercel Production."
+          else
+            # Step 2b: variable does not exist — POST to create it.
+            echo "  No existing env var found. Creating via POST…"
+            POST_RESPONSE=$(curl -sf -X POST \
+              "${BASE_URL}${TEAM_PARAM}" \
+              -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{"key":"CLOUDFLARE_CACHE_RULES_APPLIED","value":"true","type":"plain","target":["production"]}')
+
+            if [ $? -ne 0 ]; then
+              echo "::error::POST to create CLOUDFLARE_CACHE_RULES_APPLIED failed."
+              echo "::error::Response: ${POST_RESPONSE}"
+              echo "::error::Check that VERCEL_TOKEN has write access to project env vars,"
+              echo "::error::and that VERCEL_PROJECT_ID matches the correct project."
+              exit 1
+            fi
+            echo "✅ CLOUDFLARE_CACHE_RULES_APPLIED=true created in Vercel Production."
+          fi
+
+          echo ""
+          echo "The next Vercel production deployment will see this variable and the"
+          echo "next.config.mjs build gate (Finding C-1) will pass automatically."
+          echo "No manual operator step is required."
+
+      - name: Warn if rules not fully verified (skipped Vercel update)
+        if: steps.verify_rules.outputs.all_live != 'true'
+        run: |
+          echo "::warning::One or more Cloudflare cache rules were not confirmed live after apply."
+          echo "::warning::CLOUDFLARE_CACHE_RULES_APPLIED was NOT set in Vercel as a result."
+          echo "::warning::The next.config.mjs build gate will continue to warn/fail until"
+          echo "::warning::the rules are confirmed live and this workflow runs successfully."
+          echo "::warning::Check the Cloudflare dashboard under Caching → Cache Rules,"
+          echo "::warning::then re-run this workflow via workflow_dispatch to retry."

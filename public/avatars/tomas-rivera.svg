@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 150 150" width="150" height="150">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5c1a0a"/>
+      <stop offset="100%" stop-color="#5c1a0acc"/>
+    </linearGradient>
+    <clipPath id="circle">
+      <circle cx="75" cy="75" r="75"/>
+    </clipPath>
+  </defs>
+  <circle cx="75" cy="75" r="75" fill="url(#grad)"/>
+  <!-- Inner lighter circle for depth -->
+  <circle cx="75" cy="75" r="65" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="1"/>
+  <!-- Initials -->
+  <text x="75" y="75" font-family="Georgia, serif" font-size="52" font-weight="900"
+        fill="white" text-anchor="middle" dominant-baseline="central"
+        letter-spacing="2">TR</text>
+</svg>

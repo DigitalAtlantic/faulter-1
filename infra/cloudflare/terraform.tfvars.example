@@ -1,0 +1,6 @@
+# Copy this file to terraform.tfvars (gitignored) and fill in real values,
+# OR pass these as -var flags / TF_VAR_* env vars instead of using a file at
+# all (recommended for the API token in CI).
+
+cloudflare_zone_id   = "your-zone-id-here"
+cloudflare_api_token = "your-scoped-api-token-here"

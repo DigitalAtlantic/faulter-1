@@ -1,0 +1,831 @@
+# Post-deploy smoke test — runs after every push to main.
+#
+# H-5: CSRF endpoint Cloudflare cache bypass check
+# ─────────────────────────────────────────────────
+# The CSRF token endpoint (/api/csrf) sets Cache-Control: no-store in its
+# response headers, but that header alone is NOT sufficient if Cloudflare
+# has a "Cache Everything" rule configured without a bypass for /api/*.
+#
+# If Cloudflare caches the CSRF response, every user at that edge node receives
+# the same stale token — one that was set as a cookie for a different user's
+# browser. The double-submit check then fails for all subsequent users, and in
+# the worst case a stale token from a prior session could permit CSRF forgery.
+#
+# This workflow verifies that the deployed site has Cloudflare configured
+# correctly by checking the cf-cache-status response header on /api/csrf.
+# The header must be "BYPASS" — not "HIT", "MISS", or "EXPIRED".
+#
+# REQUIRED CLOUDFLARE CONFIGURATION (see also app/api/csrf/route.ts):
+#   Option A — Cache Rule in Cloudflare dashboard:
+#     Match: (http.request.uri.path matches "^/api/") OR
+#            (http.request.uri.path matches "^/_next/")
+#     Action: Bypass cache
+#
+#   Option B — Page Rule:
+#     URL pattern: your-domain.com/api/*
+#     Setting: Cache Level → Bypass
+#
+# This check deliberately fails the workflow when the header is wrong so that
+# a misconfigured CDN layer is caught before it affects real users.
+#
+# SITE_URL must be set as a repository secret (Settings → Secrets → Actions):
+#   Name:  SITE_URL
+#   Value: https://your-production-domain.com   (no trailing slash)
+#
+# The check is skipped automatically if SITE_URL is not set (e.g. on forks or
+# when the secret has not been configured yet) — it logs a warning instead of
+# failing the workflow, so it never blocks unrelated work.
+
+name: Post-deploy smoke test
+
+on:
+  push:
+    branches:
+      - main
+  # Allow triggering manually from the Actions tab (e.g. after a CDN change).
+  workflow_dispatch:
+  # M-3 fix: run weekly so a Cloudflare config change made without a code push
+  # is still caught.  A push-to-main only triggers when source changes — if
+  # someone enables "Cache Everything" in Cloudflare without touching the repo,
+  # the bypass check would never run until the next code push.
+  schedule:
+    - cron: "0 9 * * 1"  # Every Monday at 09:00 UTC
+
+jobs:
+  csrf-cache-bypass:
+    name: CSRF endpoint — Cloudflare cache bypass
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check SITE_URL secret is configured
+        id: check-secret
+        run: |
+          if [ -z "${{ secrets.SITE_URL }}" ]; then
+            # M-3 fix: on a push to main (or the weekly cron), a missing SITE_URL
+            # means the Cloudflare bypass check never runs in production — exactly
+            # the scenario where a misconfigured CDN layer could go undetected.
+            # Fail loudly so the operator is forced to configure the secret rather
+            # than silently skipping a safety-critical check.
+            #
+            # On pull_request and workflow_dispatch we keep the original warn-and-
+            # skip behaviour: forks and draft PRs legitimately don't have SITE_URL,
+            # and blocking them would prevent all contributor CI from passing.
+            if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+              echo "::error::SITE_URL secret is not configured. The Cloudflare cache-bypass check cannot run."
+              echo "::error::Fix: add SITE_URL to your repository secrets (Settings → Secrets → Actions)."
+              echo "::error::Value: the full production URL, e.g. https://faulter.news (no trailing slash)."
+              exit 1
+            else
+              echo "::warning::SITE_URL secret is not set — skipping CSRF cache-bypass check."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait for deployment to propagate
+        if: steps.check-secret.outputs.skip == 'false'
+        # Give Vercel / the CDN time to finish deploying before we probe.
+        # Adjust this delay if your deployment pipeline takes longer.
+        run: sleep 30
+
+      - name: Verify cf-cache-status is BYPASS on /api/csrf
+        if: steps.check-secret.outputs.skip == 'false'
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          echo "Probing ${SITE_URL}/api/csrf for Cloudflare cache headers…"
+
+          # Fetch headers only (-I), follow redirects (-L), fail on HTTP errors (-f).
+          # The User-Agent mimics a real browser so Cloudflare applies the same
+          # cache rules it would for a normal visitor.
+          HEADERS=$(curl -fsIL \
+            --max-time 15 \
+            --retry 3 \
+            --retry-delay 5 \
+            -H "User-Agent: Mozilla/5.0 (compatible; FaulterSmokeTest/1.0)" \
+            "${SITE_URL}/api/csrf")
+
+          echo "--- Response headers ---"
+          echo "$HEADERS"
+          echo "------------------------"
+
+          # Extract cf-cache-status (case-insensitive header name).
+          CF_STATUS=$(echo "$HEADERS" | grep -i "^cf-cache-status:" | awk '{print $2}' | tr -d '\r')
+
+          if [ -z "$CF_STATUS" ]; then
+            # No cf-cache-status header at all means the request did not go
+            # through Cloudflare (local dev, non-CF hosting, or a non-proxied
+            # DNS record).  Skip rather than fail so this check does not block
+            # non-Cloudflare deployments.
+            echo "::notice::cf-cache-status header absent — site may not be proxied through Cloudflare. Skipping bypass check."
+            exit 0
+          fi
+
+          echo "cf-cache-status: ${CF_STATUS}"
+
+          if [ "$CF_STATUS" = "BYPASS" ]; then
+            echo "✅ Cloudflare is correctly bypassing the cache for /api/csrf."
+            exit 0
+          else
+            echo "::error::cf-cache-status is '${CF_STATUS}' — expected 'BYPASS'."
+            echo ""
+            echo "This means Cloudflare may be caching CSRF tokens and serving"
+            echo "the same token to multiple users, breaking form submissions"
+            echo "and potentially enabling CSRF attacks."
+            echo ""
+            echo "Fix: add a Cloudflare Cache Rule to bypass caching for /api/*"
+            echo "See app/api/csrf/route.ts for the full configuration guide."
+            exit 1
+          fi
+
+  # ── Cache eligibility check (Finding C-1) ──────────────────────────────────
+  #
+  # The CSRF bypass job above only verifies that /api/* is NOT cached.
+  # It does NOT verify that HTML content routes ARE cached — meaning the
+  # original C-1 bug ("cache rule written but never applied") would have
+  # passed the existing smoke test with a green checkmark indefinitely.
+  #
+  # This job closes that gap. It fetches the home page twice: the first
+  # request should be a MISS (cold cache), the second should be a HIT.
+  # If the second request is still DYNAMIC or BYPASS, the Cache Rule is not
+  # active on the zone and the deploy must be blocked.
+  #
+  # Why two requests and not one:
+  #   Cloudflare stores the response on the first (MISS) request and serves
+  #   it from the edge on subsequent requests (HIT). A single request can
+  #   only ever be a MISS; a HIT is proof that the eligibility rule ran,
+  #   the response was stored, and is being served from the edge — the full
+  #   caching pipeline is confirmed end-to-end.
+  #
+  # What this does NOT replace:
+  #   After the Cache Rule is applied to a fresh zone it may take a few
+  #   seconds to propagate to all Cloudflare PoPs. If the second request
+  #   arrives at a different PoP that hasn't warmed yet, it may return MISS
+  #   rather than HIT. The retry loop below (up to 5 attempts with a 5 s
+  #   delay) handles this gracefully.
+  html-cache-eligibility:
+    name: HTML routes — Cloudflare cache eligibility (Finding C-1)
+    runs-on: ubuntu-latest
+    # Run after the CSRF check so we don't waste time if the baseline is broken.
+    needs: csrf-cache-bypass
+
+    steps:
+      - name: Check SITE_URL secret is configured
+        id: check-secret
+        run: |
+          if [ -z "${{ secrets.SITE_URL }}" ]; then
+            if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+              echo "::error::SITE_URL secret is not configured. The HTML cache-eligibility check cannot run."
+              echo "::error::Fix: add SITE_URL to your repository secrets (Settings → Secrets → Actions)."
+              exit 1
+            else
+              echo "::warning::SITE_URL secret is not set — skipping HTML cache-eligibility check."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait for deployment to propagate
+        if: steps.check-secret.outputs.skip == 'false'
+        run: sleep 30
+
+      - name: First request — warm the Cloudflare edge cache
+        if: steps.check-secret.outputs.skip == 'false'
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          echo "Warming edge cache: GET ${SITE_URL}/"
+          curl -fsIL \
+            --max-time 15 \
+            --retry 3 \
+            --retry-delay 5 \
+            -H "User-Agent: Mozilla/5.0 (compatible; FaulterSmokeTest/1.0)" \
+            "${SITE_URL}/" > /dev/null
+          echo "First request complete — Cloudflare should now store the response."
+
+      - name: Wait for edge propagation
+        if: steps.check-secret.outputs.skip == 'false'
+        # Give Cloudflare a moment to write the response to its edge store
+        # and propagate to the PoP this runner will hit on the second request.
+        run: sleep 5
+
+      - name: Second request — verify cf-cache-status is HIT
+        if: steps.check-secret.outputs.skip == 'false'
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          echo "Verifying cache HIT on second request to ${SITE_URL}/"
+
+          HIT=false
+          for attempt in 1 2 3 4 5; do
+            HEADERS=$(curl -fsIL \
+              --max-time 15 \
+              --retry 2 \
+              --retry-delay 3 \
+              -H "User-Agent: Mozilla/5.0 (compatible; FaulterSmokeTest/1.0)" \
+              "${SITE_URL}/")
+
+            echo "--- Attempt ${attempt}: Response headers ---"
+            echo "$HEADERS"
+            echo "--------------------------------------------"
+
+            CF_STATUS=$(echo "$HEADERS" | grep -i "^cf-cache-status:" | awk '{print $2}' | tr -d '\r')
+            echo "cf-cache-status: ${CF_STATUS:-<absent>}"
+
+            if [ -z "$CF_STATUS" ]; then
+              echo "::notice::cf-cache-status header absent — site may not be proxied through Cloudflare. Skipping eligibility check."
+              exit 0
+            fi
+
+            if [ "$CF_STATUS" = "HIT" ]; then
+              echo "✅ cf-cache-status is HIT — Cloudflare cache eligibility rule is active."
+              echo "   HTML routes will be served from the edge on repeat visits."
+              HIT=true
+              break
+            fi
+
+            # EXPIRED is also a passing state: the entry exists in the cache but
+            # the TTL has elapsed. The response is still served from the edge
+            # while Cloudflare revalidates in the background.
+            if [ "$CF_STATUS" = "EXPIRED" ]; then
+              echo "✅ cf-cache-status is EXPIRED — cache entry exists; Cloudflare is revalidating."
+              echo "   This is acceptable: the eligibility rule ran and stored the entry."
+              HIT=true
+              break
+            fi
+
+            echo "   Status was '${CF_STATUS}' on attempt ${attempt}. Retrying in 5 s…"
+            sleep 5
+          done
+
+          if [ "$HIT" = "false" ]; then
+            echo ""
+            echo "::error::cf-cache-status is '${CF_STATUS}' after 5 attempts — expected 'HIT' or 'EXPIRED'."
+            echo ""
+            echo "This means Cloudflare's cache eligibility rule is NOT active on the zone."
+            echo "Every HTML request reaches Vercel origin compute (0% cache hit ratio)."
+            echo "This is audit Finding C-1 (Critical)."
+            echo ""
+            echo "Fix:"
+            echo "  Option A (recommended) — trigger the 'Apply Cloudflare cache rules'"
+            echo "  workflow manually from the Actions tab. Requires CLOUDFLARE_ZONE_ID"
+            echo "  and CLOUDFLARE_API_TOKEN secrets to be configured."
+            echo ""
+            echo "  Option B — apply manually via the Cloudflare dashboard."
+            echo "  See infra/cloudflare/README.md for step-by-step instructions."
+            exit 1
+          fi
+
+  # ── Cache-key normalisation check (Finding C-2) ────────────────────────────
+  #
+  # CategoryArticleList and TagArticleList use router.push() for sort/page
+  # params so no new HTTP request is made during in-browser navigation — the
+  # ISR shell is already loaded. But a user arriving from an external link
+  # (e.g. /category/technology?sort=oldest&page=3) causes Cloudflare to see a
+  # distinct cache key and generate a separate cold-start entry, fragmenting
+  # the cache across the full sort×page matrix.
+  #
+  # The cache-key normalisation rule in infra/cloudflare/cache_rules.tf
+  # (cloudflare_ruleset.category_tag_cache_key) strips `sort` and `page` from
+  # the Cloudflare cache key for /category/* and /tag/*. When active, any
+  # (sort, page) variant of a category URL hits the same pre-warmed ISR entry
+  # as the bare slug URL.
+  #
+  # How this test verifies it end-to-end:
+  #   1. Warm the cache with GET /category/<slug>        → expect MISS (cold)
+  #   2. Request GET /category/<slug>?sort=oldest&page=3 → expect HIT
+  #      If normalisation is active, `sort` and `page` are excluded from the
+  #      cache key so request 2 resolves to the same stored entry as request 1.
+  #      If the rule is NOT active, request 2 has a different cache key → MISS.
+  #
+  # This job is gated on html-cache-eligibility passing: normalisation cannot
+  # be verified if the eligibility rule itself isn't active (every request
+  # would be DYNAMIC regardless of the cache key).
+  #
+  # SMOKE_TEST_CATEGORY_SLUG (optional repository variable):
+  #   Override the category slug used for this test. Defaults to "technology"
+  #   which is a seeded category in this project. Set this variable at
+  #   Settings → Secrets and variables → Actions → Variables → New variable
+  #   if your deployment uses different category slugs.
+  category-tag-cache-key-normalisation:
+    name: Category/tag cache-key normalisation (Finding C-2)
+    runs-on: ubuntu-latest
+    needs: html-cache-eligibility
+
+    steps:
+      - name: Check SITE_URL secret is configured
+        id: check-secret
+        run: |
+          if [ -z "${{ secrets.SITE_URL }}" ]; then
+            if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+              echo "::error::SITE_URL secret is not configured. The cache-key normalisation check cannot run."
+              exit 1
+            else
+              echo "::warning::SITE_URL secret is not set — skipping cache-key normalisation check."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve test category slug
+        if: steps.check-secret.outputs.skip == 'false'
+        id: resolve-slug
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+          # Use the repository variable if set, otherwise fall back to "technology"
+          # (a seeded category present in this project's fixture data).
+          OVERRIDE_SLUG: ${{ vars.SMOKE_TEST_CATEGORY_SLUG }}
+        run: |
+          SLUG="${OVERRIDE_SLUG:-technology}"
+          TEST_URL="${SITE_URL}/category/${SLUG}"
+
+          echo "Probing ${TEST_URL} to confirm the route exists…"
+          HTTP_STATUS=$(curl -fsILo /dev/null -w "%{http_code}" \
+            --max-time 10 \
+            -H "User-Agent: Mozilla/5.0 (compatible; FaulterSmokeTest/1.0)" \
+            "${TEST_URL}" 2>/dev/null || echo "000")
+
+          echo "HTTP status: ${HTTP_STATUS}"
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "slug=${SLUG}" >> "$GITHUB_OUTPUT"
+            echo "test_url=${TEST_URL}" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::${TEST_URL} returned HTTP ${HTTP_STATUS}."
+            echo "::warning::Set the SMOKE_TEST_CATEGORY_SLUG repository variable to a slug"
+            echo "::warning::that exists on this deployment, or seed the 'technology' category."
+            echo "::warning::Skipping cache-key normalisation check."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Warm cache with bare category URL
+        if: steps.check-secret.outputs.skip == 'false' && steps.resolve-slug.outputs.skip == 'false'
+        env:
+          TEST_URL: ${{ steps.resolve-slug.outputs.test_url }}
+        run: |
+          echo "Warming cache: GET ${TEST_URL}"
+          curl -fsIL \
+            --max-time 15 \
+            --retry 3 \
+            --retry-delay 5 \
+            -H "User-Agent: Mozilla/5.0 (compatible; FaulterSmokeTest/1.0)" \
+            "${TEST_URL}" > /dev/null
+          echo "Warm request complete."
+
+      - name: Wait for edge propagation
+        if: steps.check-secret.outputs.skip == 'false' && steps.resolve-slug.outputs.skip == 'false'
+        run: sleep 5
+
+      - name: Verify parameterised URL resolves from the same cache entry (HIT)
+        if: steps.check-secret.outputs.skip == 'false' && steps.resolve-slug.outputs.skip == 'false'
+        env:
+          TEST_URL: ${{ steps.resolve-slug.outputs.test_url }}
+          SLUG: ${{ steps.resolve-slug.outputs.slug }}
+        run: |
+          # Request the same slug with sort and page query params.
+          # If the cache-key normalisation rule is active, `sort` and `page`
+          # are excluded from the cache key, so this URL resolves to the same
+          # stored entry as the bare slug URL warmed in the previous step → HIT.
+          # If the rule is NOT active, this is a distinct cache key → MISS.
+          PARAM_URL="${TEST_URL}?sort=oldest&page=3"
+          echo "Testing normalisation: GET ${PARAM_URL}"
+          echo "(expect HIT — same cache entry as bare slug if rule is active)"
+
+          HIT=false
+          for attempt in 1 2 3 4 5; do
+            HEADERS=$(curl -fsIL \
+              --max-time 15 \
+              --retry 2 \
+              --retry-delay 3 \
+              -H "User-Agent: Mozilla/5.0 (compatible; FaulterSmokeTest/1.0)" \
+              "${PARAM_URL}")
+
+            echo "--- Attempt ${attempt}: Response headers ---"
+            echo "$HEADERS"
+            echo "--------------------------------------------"
+
+            CF_STATUS=$(echo "$HEADERS" | grep -i "^cf-cache-status:" | awk '{print $2}' | tr -d '\r')
+            echo "cf-cache-status: ${CF_STATUS:-<absent>}"
+
+            if [ -z "$CF_STATUS" ]; then
+              echo "::notice::cf-cache-status absent — not proxied through Cloudflare. Skipping."
+              exit 0
+            fi
+
+            if [ "$CF_STATUS" = "HIT" ] || [ "$CF_STATUS" = "EXPIRED" ]; then
+              echo ""
+              echo "✅ cf-cache-status is ${CF_STATUS} for ${PARAM_URL}"
+              echo "   Cache-key normalisation is active: sort and page params are excluded"
+              echo "   from the Cloudflare cache key for /category/* and /tag/*."
+              echo "   External links with ?sort= or ?page= params serve from the pre-warmed"
+              echo "   ISR entry rather than generating cold-start origin hits."
+              HIT=true
+              break
+            fi
+
+            echo "   Status was '${CF_STATUS}' on attempt ${attempt}. Retrying in 5 s…"
+            sleep 5
+          done
+
+          if [ "$HIT" = "false" ]; then
+            echo ""
+            echo "::error::cf-cache-status is '${CF_STATUS}' for /category/${SLUG}?sort=oldest&page=3"
+            echo "::error::Expected 'HIT' — bare slug was warmed in the previous step, so a"
+            echo "::error::parameterised variant must resolve to the same entry if normalisation"
+            echo "::error::is active. A MISS here means sort and page are NOT being stripped from"
+            echo "::error::the Cloudflare cache key (Finding C-2)."
+            echo ""
+            echo "Impact: every unique (sort, page) combination arriving from an external link"
+            echo "causes a separate cold-start hit against Vercel origin, fragmenting the ISR"
+            echo "cache across the full sort×page matrix."
+            echo ""
+            echo "Fix: trigger the 'Apply Cloudflare cache rules' workflow or apply"
+            echo "cloudflare_ruleset.category_tag_cache_key manually."
+            echo "See infra/cloudflare/README.md — same apply as Finding C-1."
+            exit 1
+          fi
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Critical fix smoke test: /api/breaking must be cached at the edge.
+  #
+  # Before the fix two independent layers defeated the route's own
+  # Cache-Control: public, s-maxage=60 header:
+  #   1. vercel.json's /api/(.*) rule overwrote it with no-store, private.
+  #   2. Cloudflare's bypass_api_and_search rule set cache=false for all
+  #      /api/* paths, so even a correct header never reached the edge cache.
+  #
+  # The fix:
+  #   1. A second vercel.json header rule - placed AFTER the blanket
+  #      /api/(.*) rule - sets Cache-Control/CDN-Cache-Control/Surrogate-Control
+  #      back to public, s-maxage=60, stale-while-revalidate=300 specifically
+  #      for /api/breaking. Vercel applies header rules in order; the last
+  #      matched rule wins for duplicate keys, so the specific rule wins.
+  #   2. The Cloudflare bypass expression is narrowed:
+  #        was:  starts_with(path, "/api/")
+  #        now:  starts_with(path, "/api/") AND path ne "/api/breaking"
+  #      /api/breaking now falls through to cache_eligible_public_routes with
+  #      edge_ttl mode = "respect_origin", so Cloudflare honours s-maxage=60.
+  #
+  # This job proves the fix works end-to-end: two requests, second must HIT.
+  # ──────────────────────────────────────────────────────────────────────────
+
+  breaking-api-cache-hit:
+    name: /api/breaking -- Cloudflare edge cache HIT (Critical fix)
+    runs-on: ubuntu-latest
+    needs: csrf-cache-bypass
+
+    steps:
+      - name: Check SITE_URL secret is configured
+        id: check-secret
+        run: |
+          if [ -z "${{ secrets.SITE_URL }}" ]; then
+            if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+              echo "::error::SITE_URL secret is not configured. The /api/breaking cache check cannot run."
+              exit 1
+            else
+              echo "::warning::SITE_URL secret is not set -- skipping /api/breaking cache check."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: First request -- warm the Cloudflare edge cache for /api/breaking
+        if: steps.check-secret.outputs.skip == 'false'
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          echo "Warming edge cache: GET ${SITE_URL}/api/breaking"
+          curl -fsIL \
+            --max-time 15 \
+            --retry 3 \
+            --retry-delay 5 \
+            -H "User-Agent: Mozilla/5.0 (compatible; FaulterSmokeTest/1.0)" \
+            "${SITE_URL}/api/breaking" > /dev/null
+          echo "Warm request complete."
+
+      - name: Wait for edge propagation
+        if: steps.check-secret.outputs.skip == 'false'
+        run: sleep 5
+
+      - name: Second request -- verify cf-cache-status is HIT on /api/breaking
+        if: steps.check-secret.outputs.skip == 'false'
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          echo "Verifying cache HIT on second request to ${SITE_URL}/api/breaking"
+
+          HIT=false
+          for attempt in 1 2 3 4 5; do
+            HEADERS=$(curl -fsIL \
+              --max-time 15 \
+              --retry 2 \
+              --retry-delay 3 \
+              -H "User-Agent: Mozilla/5.0 (compatible; FaulterSmokeTest/1.0)" \
+              "${SITE_URL}/api/breaking")
+
+            echo "--- Attempt ${attempt}: Response headers ---"
+            echo "$HEADERS"
+            echo "--------------------------------------------"
+
+            CF_STATUS=$(echo "$HEADERS" | grep -i "^cf-cache-status:" | awk '{print $2}' | tr -d '\r')
+            echo "cf-cache-status: ${CF_STATUS:-<absent>}"
+
+            if [ -z "$CF_STATUS" ]; then
+              echo "::notice::cf-cache-status absent -- site may not be proxied through Cloudflare. Skipping."
+              exit 0
+            fi
+
+            # BYPASS or DYNAMIC means one of the two fix layers is not active.
+            if [ "$CF_STATUS" = "BYPASS" ] || [ "$CF_STATUS" = "DYNAMIC" ]; then
+              echo "::error::cf-cache-status is '${CF_STATUS}' -- /api/breaking is NOT being cached at the edge."
+              echo ""
+              echo "This means at least one of the two fix layers is missing:"
+              echo "  Layer 1 -- vercel.json: the /api/breaking override rule may not be"
+              echo "    deployed. The /api/(.*) no-store rule is overwriting the route's"
+              echo "    Cache-Control header before Cloudflare sees it."
+              echo "  Layer 2 -- Cloudflare Terraform: the bypass_api_and_search expression"
+              echo "    may still include /api/breaking (cache=false for all /api/*). Apply"
+              echo "    infra/cloudflare/cache_rules.tf via the 'Apply Cloudflare cache rules'"
+              echo "    workflow or terraform apply manually."
+              echo ""
+              echo "Impact: every BreakingNewsTicker mount triggers a fresh Vercel origin"
+              echo "invocation (O(pageviews) instead of O(60s x PoP count))."
+              exit 1
+            fi
+
+            if [ "$CF_STATUS" = "HIT" ] || [ "$CF_STATUS" = "EXPIRED" ]; then
+              echo ""
+              echo "OK cf-cache-status is ${CF_STATUS} -- /api/breaking is cached at the Cloudflare edge."
+              echo "   BreakingNewsTicker requests are now served from the edge cache (s-maxage=60)"
+              echo "   instead of reaching Vercel origin on every page load."
+              HIT=true
+              break
+            fi
+
+            echo "   Status was '${CF_STATUS}' on attempt ${attempt}. Retrying in 5 s..."
+            sleep 5
+          done
+
+          if [ "$HIT" = "false" ]; then
+            echo ""
+            echo "::error::cf-cache-status never reached HIT or EXPIRED after 5 attempts."
+            echo "::error::Last status: '${CF_STATUS}'"
+            echo ""
+            echo "Fix: ensure both layers of the /api/breaking cache fix are deployed:"
+            echo "  1. vercel.json: /api/breaking override rule is present and Vercel redeployed."
+            echo "  2. Cloudflare: trigger 'Apply Cloudflare cache rules' workflow or run"
+            echo "     terraform apply on infra/cloudflare/ to narrow the bypass expression."
+            exit 1
+          fi
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # High severity fix smoke test: /search static shell must be cached at edge.
+  #
+  # Before the fix /search was excluded from Cloudflare caching by two gaps:
+  #   1. cache_rules.tf bypass_api_and_search included path eq "/search",
+  #      forcing cache=false regardless of any Cache-Control header the origin
+  #      sent. (This was the actual blocker.)
+  #   2. next.config.mjs had no CDN-Cache-Control header for /search, so even
+  #      after removing the bypass, Cloudflare's respect_origin mode had no
+  #      explicit TTL to act on.
+  #
+  # The page was already a fully static shell (searchParams read was moved into
+  # the <SearchResults> client component), so the bypass and missing header were
+  # both stale — cargo-culted from the old force-dynamic architecture.
+  #
+  # The fix (both changes required together):
+  #   1. cache_rules.tf: removed path eq "/search" from bypass expression.
+  #      /search now falls through to cache_eligible_public_routes.
+  #   2. next.config.mjs: added Cache-Control/CDN-Cache-Control/Surrogate-Control
+  #      public, s-maxage=86400, stale-while-revalidate=604800 for /search.
+  #   3. cache_rules.tf: added strip_q_from_search_cache_key rule so that
+  #      /search?q=foo and /search?q=bar share a single edge cache entry.
+  #
+  # This job verifies the fix end-to-end: warm request 1, then assert HIT on
+  # request 2 (with ?q= param to confirm cache-key normalisation also works).
+  # ──────────────────────────────────────────────────────────────────────────
+
+  search-shell-cache-hit:
+    name: /search shell -- Cloudflare edge cache HIT (High severity fix)
+    runs-on: ubuntu-latest
+    needs: html-cache-eligibility
+
+    steps:
+      - name: Check SITE_URL secret is configured
+        id: check-secret
+        run: |
+          if [ -z "${{ secrets.SITE_URL }}" ]; then
+            if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+              echo "::error::SITE_URL secret is not configured. The /search cache check cannot run."
+              exit 1
+            else
+              echo "::warning::SITE_URL secret is not set -- skipping /search cache check."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: First request -- warm the Cloudflare edge cache for /search
+        if: steps.check-secret.outputs.skip == 'false'
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          echo "Warming edge cache: GET ${SITE_URL}/search"
+          curl -fsIL \
+            --max-time 15 \
+            --retry 3 \
+            --retry-delay 5 \
+            -H "User-Agent: Mozilla/5.0 (compatible; FaulterSmokeTest/1.0)" \
+            "${SITE_URL}/search" > /dev/null
+          echo "Warm request complete."
+
+      - name: Wait for edge propagation
+        if: steps.check-secret.outputs.skip == 'false'
+        run: sleep 5
+
+      - name: Second request with ?q= -- verify HIT and cache-key normalisation
+        if: steps.check-secret.outputs.skip == 'false'
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          # Request /search with a ?q= param. If strip_q_from_search_cache_key
+          # is active, this resolves to the same cache entry as the bare /search
+          # URL warmed above -> HIT. If the rule is NOT active, Cloudflare sees
+          # a distinct cache key and returns MISS.
+          TEST_URL="${SITE_URL}/search?q=smoketest"
+          echo "Verifying HIT on ${TEST_URL}"
+          echo "(warm was /search; a HIT here proves q is excluded from cache key)"
+
+          HIT=false
+          for attempt in 1 2 3 4 5; do
+            HEADERS=$(curl -fsIL \
+              --max-time 15 \
+              --retry 2 \
+              --retry-delay 3 \
+              -H "User-Agent: Mozilla/5.0 (compatible; FaulterSmokeTest/1.0)" \
+              "${TEST_URL}")
+
+            echo "--- Attempt ${attempt}: Response headers ---"
+            echo "$HEADERS"
+            echo "--------------------------------------------"
+
+            CF_STATUS=$(echo "$HEADERS" | grep -i "^cf-cache-status:" | awk '{print $2}' | tr -d '\r')
+            echo "cf-cache-status: ${CF_STATUS:-<absent>}"
+
+            if [ -z "$CF_STATUS" ]; then
+              echo "::notice::cf-cache-status absent -- not proxied through Cloudflare. Skipping."
+              exit 0
+            fi
+
+            if [ "$CF_STATUS" = "BYPASS" ] || [ "$CF_STATUS" = "DYNAMIC" ]; then
+              echo "::error::cf-cache-status is '${CF_STATUS}' -- /search is NOT being cached at the edge."
+              echo ""
+              echo "This means at least one of the two fix layers is missing:"
+              echo "  Layer 1 -- cache_rules.tf: path eq \"/search\" may still be in the"
+              echo "    bypass_api_and_search expression. Apply infra/cloudflare/ via the"
+              echo "    'Apply Cloudflare cache rules' workflow or terraform apply."
+              echo "  Layer 2 -- next.config.mjs: the /search CDN-Cache-Control header may"
+              echo "    not be deployed to Vercel. Both changes are required together."
+              echo ""
+              echo "Impact: every /search page load hits Vercel origin compute regardless"
+              echo "of how many times the same shell has been requested."
+              exit 1
+            fi
+
+            if [ "$CF_STATUS" = "HIT" ] || [ "$CF_STATUS" = "EXPIRED" ]; then
+              echo ""
+              echo "OK cf-cache-status is ${CF_STATUS} -- /search shell is cached at the edge."
+              echo "   The HIT on /search?q=smoketest confirms the strip_q_from_search_cache_key"
+              echo "   rule is active: the q param was excluded from the cache key so"
+              echo "   /search?q=smoketest resolved to the /search entry warmed in step 1."
+              HIT=true
+              break
+            fi
+
+            echo "   Status was '${CF_STATUS}' on attempt ${attempt}. Retrying in 5 s..."
+            sleep 5
+          done
+
+          if [ "$HIT" = "false" ]; then
+            echo ""
+            echo "::error::cf-cache-status never reached HIT or EXPIRED after 5 attempts."
+            echo "::error::Last status: '${CF_STATUS}'"
+            echo ""
+            echo "Fix: ensure all three changes of the /search cache fix are deployed:"
+            echo "  1. cache_rules.tf: /search removed from bypass expression (terraform apply)."
+            echo "  2. next.config.mjs: /search CDN-Cache-Control header deployed to Vercel."
+            echo "  3. cache_rules.tf: strip_q_from_search_cache_key rule present (terraform apply)."
+            exit 1
+          fi
+
+
+  # ── MED-3: MongoDB collection validator presence check ─────────────────────
+  #
+  # createCollectionValidators() in lib/db.ts applies a JSON Schema validator
+  # to contact_submissions that enforces maxLength: 5000 on message and
+  # requires correct BSON types on all fields (including createdAt as Date,
+  # which is load-bearing for the TTL index).
+  #
+  # This validator is applied by scripts/create-indexes.ts, which is a manual
+  # one-time setup step (npm run create-indexes). If the script was never run
+  # against the production Atlas cluster, the validator is absent and the
+  # application-layer .slice(0, 5000) is the only cap — no DB-layer defence.
+  #
+  # This job probes the deployed app's /api/health-db endpoint (if present)
+  # or uses a mongosh shell script to confirm the validator exists.
+  #
+  # Since we can't connect to Atlas directly from GitHub Actions without
+  # exposing DATABASE_URL as a secret (acceptable but optional), this job
+  # takes the lightweight approach: it checks that the deployed app emits
+  # a known validator-verified header on the contact endpoint's OPTIONS
+  # preflight, OR it documents the manual verification command.
+  #
+  # ── What this job actually does ────────────────────────────────────────────
+  # Runs the mongosh verification command as a reminder in workflow output,
+  # and requires MONGODB_VALIDATOR_CONFIRMED=true to be set as a repository
+  # variable once the operator has run create-indexes and verified via
+  # db.getCollectionInfos(). This is the same acknowledgement-token pattern
+  # used by ATLAS_IP_RESTRICTED and CLOUDFLARE_CACHE_RULES_APPLIED.
+  #
+  # MONGODB_VALIDATOR_CONFIRMED (repository variable — not a secret):
+  #   Set to "true" at Settings → Secrets and variables → Actions → Variables
+  #   AFTER running `npm run create-indexes` against the production Atlas
+  #   cluster AND verifying the validator is present with:
+  #
+  #     db.getCollectionInfos({ name: "contact_submissions" })
+  #       .map(c => JSON.stringify(c.options?.validator, null, 2))
+  #
+  #   Expected: a $jsonSchema object with required: ["name","email","message",
+  #   "createdAt"] and bsonType constraints. If the output is null or {}, the
+  #   validator is absent — re-run the script before setting this variable.
+  #
+  # On push to main: if MONGODB_VALIDATOR_CONFIRMED is not "true", the job
+  # fails with a clear error pointing to the runbook. This catches the case
+  # where a new Atlas cluster is provisioned (e.g. disaster recovery, staging
+  # promotion) without re-running the index/validator setup script.
+  mongodb-validator-presence:
+    name: MongoDB — collection validator presence (MED-3)
+    runs-on: ubuntu-latest
+    # Independent of cache checks — DB validator is unrelated to CDN config.
+
+    steps:
+      - name: Check MONGODB_VALIDATOR_CONFIRMED variable
+        run: |
+          CONFIRMED="${{ vars.MONGODB_VALIDATOR_CONFIRMED }}"
+
+          echo "══════════════════════════════════════════════════════════════"
+          echo "MED-3: MongoDB collection validator presence check"
+          echo "══════════════════════════════════════════════════════════════"
+          echo ""
+          echo "The JSON Schema validator on contact_submissions (message"
+          echo "maxLength:5000, required BSON types, TTL-load-bearing Date"
+          echo "constraint on createdAt) is applied by:"
+          echo ""
+          echo "  npm run create-indexes"
+          echo ""
+          echo "This script must be run once against EACH Atlas cluster"
+          echo "(production, staging, DR) after provisioning."
+          echo ""
+          echo "── Verification command (run in mongosh) ──────────────────"
+          echo "  use faulter"
+          echo "  db.getCollectionInfos({ name: "contact_submissions" })"
+          echo "    .map(c => JSON.stringify(c.options?.validator, null, 2))"
+          echo ""
+          echo "Expected: \$jsonSchema with required: ["name","email","
+          echo ""message","createdAt"] and bsonType on each field."
+          echo "If output is null or {}: validator absent — run the script."
+          echo "───────────────────────────────────────────────────────────"
+          echo ""
+
+          if [ "$CONFIRMED" = "true" ]; then
+            echo "✅ MONGODB_VALIDATOR_CONFIRMED=true — operator has confirmed"
+            echo "   the validator is present on the Atlas cluster."
+            exit 0
+          fi
+
+          # On push to main or scheduled runs, require explicit confirmation.
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "::error::MONGODB_VALIDATOR_CONFIRMED is not set to "true"."
+            echo "::error::"
+            echo "::error::Action required:"
+            echo "::error::  1. Run: npm run create-indexes (against production Atlas)"
+            echo "::error::  2. Verify: db.getCollectionInfos({name:"contact_submissions"})"
+            echo "::error::             .map(c => JSON.stringify(c.options?.validator, null, 2))"
+            echo "::error::     Expected: \$jsonSchema object with required fields."
+            echo "::error::  3. Set MONGODB_VALIDATOR_CONFIRMED=true at:"
+            echo "::error::     Settings → Secrets and variables → Actions → Variables"
+            echo "::error::"
+            echo "::error::Without this, the DB-layer message-length cap (maxLength:5000)"
+            echo "::error::on contact_submissions is absent. The application-layer .slice()"
+            echo "::error::is the only guard — no defence-in-depth at the database layer."
+            exit 1
+          else
+            echo "::warning::MONGODB_VALIDATOR_CONFIRMED is not set — skipping hard check"
+            echo "::warning::on non-push event. Set this variable after running create-indexes."
+          fi
