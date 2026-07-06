@@ -1,9 +1,6 @@
-{
+﻿{
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "buildCommand": "npm run build",
   "trailingSlash": false,
-  "cleanUrls": false,
-  "regions": [
-    "auto"
-  ]
+  "cleanUrls": false
 }
